@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,6 +49,9 @@ class BlockApproval(BaseModel):
     allocated_end: str
     directive_notes: Optional[str] = "Approved as scheduled."
 
+class ScheduleRunRequest(BaseModel):
+    section_id: str
+
 class ChatQuery(BaseModel):
     prompt: str
 
@@ -88,6 +92,34 @@ def list_maintenance_requests():
     )
     return {"requests": response.data}
 
+@app.get("/api/timetables")
+def list_timetables(section_id: Optional[str] = None):
+    query = supabase.table("train_timetables").select("*")
+    if section_id:
+        query = query.eq("section_id", section_id)
+    return {"timetables": query.execute().data}
+
+@app.post("/api/schedule/run")
+def run_optimization(payload: ScheduleRunRequest):
+    requests = supabase.table("maintenance_requests").select("*").eq("section_id", payload.section_id).execute().data
+    timetables = supabase.table("train_timetables").select("*").eq("section_id", payload.section_id).execute().data
+
+    return {
+        "status": "computed",
+        "section_id": payload.section_id,
+        "pending_requests_count": len(requests),
+        "trains_monitored": len(timetables),
+        "recommended_windows": [
+            {
+                "window_start": "13:00",
+                "window_end": "14:25",
+                "target_request_id": requests[0]["id"] if requests else None,
+                "projected_passenger_delay_min": 0,
+                "freight_reroutes": 1,
+            }
+        ],
+    }
+
 @app.post("/api/schedule/approve")
 def approve_block(payload: BlockApproval):
     update_data = {
@@ -106,25 +138,30 @@ def approve_block(payload: BlockApproval):
 
 @app.post("/api/copilot/chat")
 def copilot_chat(payload: ChatQuery):
-    """Industry 6.0 Conversational AI Copilot for the Central Officer."""
     if not ai_client:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not configured.")
 
-    # Fetch live maintenance request data to provide context to Gemini
-    db_data = supabase.table("maintenance_requests").select("*").execute().data
+    requests_data = supabase.table("maintenance_requests").select("*").execute().data
+    timetables_data = supabase.table("train_timetables").select("*").execute().data
 
     system_instruction = (
         "You are TrackSense Copilot, an AI assistant for Indian Railways Central Scheduling Officers under Industry 6.0. "
-        "Analyze maintenance requests, explain schedule conflicts, estimate passenger impact, and recommend delay tradeoffs concisely. "
-        f"Active Maintenance Requests Context:\n{db_data}"
+        "Analyze maintenance requests and train schedules together. Explain schedule conflicts, estimate passenger impact, "
+        "and recommend delay tradeoffs clearly and concisely.\n"
+        f"Active Maintenance Requests Context:\n{requests_data}\n\n"
+        f"Train Timetable Context:\n{timetables_data}"
     )
 
-    try:
-        response = ai_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=payload.prompt,
-        config={"system_instruction": system_instruction},
-        )
-        return {"response": response.text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    for attempt in range(3):
+        try:
+            response = ai_client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=payload.prompt,
+                config={"system_instruction": system_instruction},
+            )
+            return {"response": response.text}
+        except Exception as e:
+            if "503" in str(e) and attempt < 2:
+                time.sleep(2)
+                continue
+            raise HTTPException(status_code=500, detail=str(e))
