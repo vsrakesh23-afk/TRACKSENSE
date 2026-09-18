@@ -1,5 +1,7 @@
 import os
 import time
+from datetime import datetime
+from scheduler import solve_maintenance_block
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -101,23 +103,57 @@ def list_timetables(section_id: Optional[str] = None):
 
 @app.post("/api/schedule/run")
 def run_optimization(payload: ScheduleRunRequest):
-    requests = supabase.table("maintenance_requests").select("*").eq("section_id", payload.section_id).execute().data
-    timetables = supabase.table("train_timetables").select("*").eq("section_id", payload.section_id).execute().data
+    """Executes Member 1's CP-SAT solver against Supabase maintenance and timetable records."""
+    requests = (
+        supabase.table("maintenance_requests")
+        .select("*")
+        .eq("section_id", payload.section_id)
+        .order("ml_priority_score", desc=True)
+        .execute()
+        .data
+    )
+    timetables = (
+        supabase.table("train_timetables")
+        .select("*")
+        .eq("section_id", payload.section_id)
+        .execute()
+        .data
+    )
+
+    if not requests:
+        return {"status": "error", "message": f"No pending maintenance requests found for section {payload.section_id}."}
+
+    # Pick the highest priority maintenance request
+    target_job = requests[0]
+    duration_mins = target_job.get("duration_minutes", 60)
+
+    # Convert timetable departures/arrivals into relative minute intervals
+    train_intervals = []
+    for train in timetables:
+        try:
+            dep = datetime.fromisoformat(train["scheduled_departure"].replace("Z", "+00:00"))
+            arr = datetime.fromisoformat(train["scheduled_arrival"].replace("Z", "+00:00"))
+            # Map minutes into a day window (0 - 1440 mins)
+            start_m = dep.hour * 60 + dep.minute
+            end_m = arr.hour * 60 + arr.minute
+            if end_m > start_m:
+                train_intervals.append((start_m, end_m))
+        except Exception:
+            continue
+
+    # Fallback to simulated intervals if timetable records lack valid timestamps
+    if not train_intervals:
+        train_intervals = [(60, 120), (180, 240)]
+
+    # Call Member 1's solver
+    solver_output = solve_maintenance_block(train_intervals, block_duration_mins=duration_mins)
 
     return {
         "status": "computed",
         "section_id": payload.section_id,
-        "pending_requests_count": len(requests),
-        "trains_monitored": len(timetables),
-        "recommended_windows": [
-            {
-                "window_start": "13:00",
-                "window_end": "14:25",
-                "target_request_id": requests[0]["id"] if requests else None,
-                "projected_passenger_delay_min": 0,
-                "freight_reroutes": 1,
-            }
-        ],
+        "target_maintenance_request": target_job,
+        "trains_evaluated": len(train_intervals),
+        "solver_result": solver_output
     }
 
 @app.post("/api/schedule/approve")
